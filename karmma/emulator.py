@@ -69,41 +69,26 @@ class ClEmu:
     def __init__(self, data, N_PCA):
         theta, cl = data
         self.N_PCA = N_PCA
-        self.train_x = torch.Tensor(theta).to(torch.double)
         log_cl = np.log(cl.reshape((cl.shape[0], -1)) + 1e-25)
         pca = PCA(N_PCA)
         pca.fit(log_cl)
         pca_coeff = pca.transform(log_cl)
-        self.PCA_MEAN = torch.Tensor(np.mean(pca_coeff, axis=0)[np.newaxis]).to(torch.double)
-        self.PCA_STD  = torch.Tensor(np.std(pca_coeff, axis=0)[np.newaxis]).to(torch.double)
-        self.pca_coeff_norm = (torch.Tensor(pca_coeff).to(torch.double) - self.PCA_MEAN) / self.PCA_STD
+        
+        self.pca_coeff_emulators = [ScalarEmulator([theta, pca_coeff[i]]) for i in range(N_PCA)]
         
         self.pca_mean = torch.Tensor(pca.mean_).to(torch.double)
         self.pca_components = torch.Tensor(pca.components_[:,np.newaxis])
     
     def train_emu(self):
-        models = []
-        likelihoods = []
         for i in range(self.N_PCA):
             print("Training GP # %d"%(i+1))
-            train_y = torch.Tensor(self.pca_coeff_norm[:,i])
-            likelihood = gpytorch.likelihoods.GaussianLikelihood()
-            model = ExactGPModel(self.train_x, train_y, likelihood)
-            model, likelihood = train_gp(model, 
-                                         likelihood, 
-                                         [self.train_x, train_y])
-            models.append(model)
-            likelihoods.append(likelihood)
-        self.models      = models
-        self.likelihoods = likelihoods
+            self.pca_coeff_emulators[i].train_emu()
         self.trained = True
         
     def predict_emu(self, theta_pred):
-        pca_pred = torch.zeros(self.N_PCA, dtype=torch.double)
         log_cl_pred = self.pca_mean
-        for i, (model, likelihood) in enumerate(zip(self.models, self.likelihoods)):
+        for i in range(self.N_PCA):
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
-                pca_coeff_i = likelihood(model(theta_pred)).mean
-                pca_pred_i = self.PCA_MEAN[:,i] + self.PCA_STD[:,i] * pca_coeff_i
+                pca_pred_i = self.pca_coeff_emulators[i].predict_emu(theta_pred)
                 log_cl_pred = log_cl_pred + pca_pred_i * self.pca_components[i]
         return pca_coeff_i
