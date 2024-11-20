@@ -43,6 +43,28 @@ class ExactGPModel(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)        
 
+class ScalarEmulator:
+    def __init__(self, data):
+        theta, scalar = data
+        self.train_x = torch.Tensor(theta).to(torch.double)
+        self.SCALAR_MEAN = torch.Tensor([np.mean(scalar, axis=0)]).to(torch.double)
+        self.SCALAR_STD  = torch.Tensor([np.std(scalar, axis=0)]).to(torch.double)
+        self.scalar_norm = (torch.Tensor(scalar).to(torch.double) - self.SCALAR_MEAN) / self.SCALAR_STD
+        
+    def train_emu(self):
+        likelihood = gpytorch.likelihoods.GaussianLikelihood()
+        model = ExactGPModel(self.train_x, self.scalar_norm, likelihood)
+        model, likelihood = train_gp(model, 
+                                     likelihood, [self.train_x, self.scalar_norm])
+        self.model      = model
+        self.likelihood = likelihood
+        self.trained = True
+        
+    def predict_emu(self, theta_pred):
+        scalar_norm_pred = self.likelihood(self.model(theta_pred)).mean
+        scalar_pred = self.SCALAR_MEAN + self.SCALAR_STD * scalar_norm_pred
+        return scalar_pred
+        
 class ClEmu:
     def __init__(self, data, N_PCA):
         theta, cl = data
