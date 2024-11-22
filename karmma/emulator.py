@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from sklearn.decomposition import PCA
 
-def train_gp(model, likelihood, train_data, training_iter=50, verbose=False):
+def train_gp(model, likelihood, train_data, training_iter=200, verbose=False):
     train_x, train_y = train_data
     model.train()
     likelihood.train()
@@ -65,6 +65,23 @@ class ScalarEmulator:
         scalar_pred = self.SCALAR_MEAN + self.SCALAR_STD * scalar_norm_pred
         return scalar_pred
         
+class TomographicEmulator:  
+    def __init__(self, data):        
+        theta, y_tomo = data
+        self.N_Z_BINS = y_tomo.shape[1]
+        self.y_emu = [ScalarEmulator([theta, y_tomo[:,i]]) for i in range(self.N_Z_BINS)]
+
+    def train_emu(self):
+        for i in range(self.N_Z_BINS):
+            self.y_emu[i].train_emu()
+        self.trained = True
+        
+    def predict_emu(self, theta_pred):
+        y_pred = torch.zeros(self.N_Z_BINS)
+        for i in range(self.N_Z_BINS):
+            y_pred[i] = self.y_emu[i].predict_emu(theta_pred)
+        return y_pred
+    
 class ClEmu:
     def __init__(self, data, N_PCA):
         theta, cl = data
@@ -73,8 +90,7 @@ class ClEmu:
         pca = PCA(N_PCA)
         pca.fit(log_cl)
         pca_coeff = pca.transform(log_cl)
-        
-        self.pca_coeff_emulators = [ScalarEmulator([theta, pca_coeff[i]]) for i in range(N_PCA)]
+        self.pca_coeff_emulators = [ScalarEmulator([theta, pca_coeff[:,i]]) for i in range(N_PCA)]
         
         self.pca_mean = torch.Tensor(pca.mean_).to(torch.double)
         self.pca_components = torch.Tensor(pca.components_[:,np.newaxis])
@@ -91,4 +107,5 @@ class ClEmu:
             with torch.no_grad(), gpytorch.settings.fast_pred_var():
                 pca_pred_i = self.pca_coeff_emulators[i].predict_emu(theta_pred)
                 log_cl_pred = log_cl_pred + pca_pred_i * self.pca_components[i]
-        return pca_coeff_i
+        log_cl_pred = log_cl_pred[0].reshape((4,4,-1))
+        return torch.exp(log_cl_pred)

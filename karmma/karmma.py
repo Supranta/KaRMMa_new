@@ -1,19 +1,18 @@
 import numpy as np
 import healpy as hp
+import h5py as h5
 import torch
 import pyro
+from .emulator import TomographicEmulator, ClEmu
 import pyro.distributions as dist
 from pyro.infer import MCMC, NUTS
 from .transforms import Alm2Map, conv2shear
 import pickle
 from joblib import Parallel, delayed
 from scipy.special import eval_legendre
-##==================================
-from joblib import Parallel, delayed
-##==================================
 
 class KarmmaSampler:
-    def __init__(self, g1_obs, g2_obs, sigma_obs, mask, cl, shift, vargauss, lmax=None, gen_lmax=None, pixwin=None):
+    def __init__(self, g1_obs, g2_obs, sigma_obs, mask, cl, shift, vargauss, lmax=None, gen_lmax=None, pixwin=None, emulator_file=None):
         self.g1_obs = g1_obs       
         self.g2_obs = g2_obs
         self.N_Z_BINS = g1_obs.shape[0]
@@ -23,8 +22,7 @@ class KarmmaSampler:
         self.shift    = shift
         self.vargauss = vargauss
 
-        self.y_cl     = np.zeros_like(cl)
-        
+        self.y_cl     = np.zeros_like(cl)        
         self.mu = np.zeros(self.N_Z_BINS)
 
         self.nside = hp.get_nside(self.g1_obs)
@@ -48,13 +46,34 @@ class KarmmaSampler:
         else:
             self.pixwin_ell_filter = None
 
-        self.compute_lognorm_cl()
+        if emulator_file is not None:
+            self.train_emulator(emulator_file)
+        
+#         self.compute_lognorm_cl()
 
         theta_fid = np.array([0.233, 0.82])[np.newaxis]
-        theta_fid = torch.Tensor(theta_fid).to(torch.double)
+        self.theta_fid = torch.Tensor(theta_fid).to(torch.double)
         self.y_cl_fid = self.y_cl
         self.tensorize()
     
+    def train_emulator(self, emulator_file):
+        with h5.File(emulator_file, 'r') as f:
+            cosmo_pars = f['cosmo_pars'][:]
+            ln_pars    = f['ln_pars'][:]
+            y_cl       = f['y_cl'][:]
+
+        self.cl_emu = ClEmu([cosmo_pars, y_cl], 8)
+        self.cl_emu.train_emu()    
+
+        shift  = ln_pars[:,:,0]
+        mean_g = ln_pars[:,:,1]
+
+        self.shift_emu  = TomographicEmulator([cosmo_pars, shift])
+        self.mean_g_emu = TomographicEmulator([cosmo_pars, mean_g])
+        
+        self.shift_emu.train_emu()
+        self.mean_g_emu.train_emu()
+
     def tensorize(self):
         self.g1_obs = torch.tensor(self.g1_obs)
         self.g2_obs = torch.tensor(self.g2_obs)
@@ -113,7 +132,6 @@ class KarmmaSampler:
         
         L_arr = torch.swapaxes(L[:,:,ell[ell > -1]], 0,1)
     
-
         ylm_real = self.matmul(L_arr, xlm_real) / torch.sqrt(torch.Tensor([2.]))
         ylm_imag = self.matmul(L_arr, xlm_imag) / torch.sqrt(torch.Tensor([2.]))
 
@@ -124,22 +142,26 @@ class KarmmaSampler:
     def model(self, prior_only=False):
         ell, emm = hp.Alm.getlm(self.gen_lmax)
 
+        theta = pyro.sample('theta', dist.Normal(self.theta_fid, torch.tensor([0.05, 0.03], dtype=torch.double)))
+        
         xlm_real = pyro.sample('xlm_real', dist.Normal(torch.zeros(self.N_Z_BINS, (ell > 1).sum(), dtype=torch.double),
                                                        torch.ones(self.N_Z_BINS, (ell > 1).sum(), dtype=torch.double)))
         xlm_imag = pyro.sample('xlm_imag', dist.Normal(torch.zeros(self.N_Z_BINS, ((ell > 1) & (emm > 0)).sum(), dtype=torch.double),
                                                        torch.ones(self.N_Z_BINS, ((ell > 1) & (emm > 0)).sum(), dtype=torch.double)))
           
         xlm = self.get_xlm(xlm_real, xlm_imag)
-        y_cl = self.y_cl
+        y_cl = self.cl_emu.predict_emu(theta)
         
         ylm = self.apply_cl(xlm, y_cl)
        
-        for i in range(self.N_Z_BINS):
-            k = torch.exp(self.mu[i] + Alm2Map.apply(ylm[i], self.nside, self.gen_lmax)) - self.shift[i]
-            g1, g2 = conv2shear(k, self.lmax, self.pixwin_ell_filter)
-
-            pyro.sample(f'g1_obs_{i}', dist.Normal(g1[self.mask], self.sigma_obs[i,self.mask]), obs=self.g1_obs[i,self.mask])
-            pyro.sample(f'g2_obs_{i}', dist.Normal(g2[self.mask], self.sigma_obs[i,self.mask]), obs=self.g2_obs[i,self.mask])
+        mean_g = self.mean_g_emu.predict_emu(theta)
+        shift  = self.shift_emu.predict_emu(theta)
+        
+        for i in range(self.N_Z_BINS):         
+            k = torch.exp(mean_g[i] + Alm2Map.apply(ylm[i], self.nside, self.gen_lmax)) - shift[i]
+#             g1, g2 = conv2shear(k, self.lmax, self.pixwin_ell_filter)
+#             pyro.sample(f'g1_obs_{i}', dist.Normal(g1[self.mask], self.sigma_obs[i,self.mask]), obs=self.g1_obs[i,self.mask])
+#             pyro.sample(f'g2_obs_{i}', dist.Normal(g2[self.mask], self.sigma_obs[i,self.mask]), obs=self.g2_obs[i,self.mask])
     
     def sample(self, num_burn, num_samples, step_size=0.05, inv_mass_matrix=None, x_init=None):
         kernel = NUTS(self.model, target_accept_prob=0.65, step_size=step_size)
@@ -153,7 +175,8 @@ class KarmmaSampler:
             xlm_imag_init = torch.tensor(xlm_imag_init, dtype=torch.double)
 
         mcmc = MCMC(kernel, num_samples=num_samples, warmup_steps=num_burn,
-                    initial_params={"xlm_real": x_real_init,
+                    initial_params={"theta": self.theta_fid,
+                                    "xlm_real": x_real_init,
                                     "xlm_imag": x_imag_init})
         mcmc.run()
         self.samps = mcmc.get_samples()

@@ -11,6 +11,7 @@ class KarmmaConfig:
         self.analysis = self.set_config_analysis(config_args['analysis'])
         self.set_config_io(config_args['io'])
         self.set_config_mcmc(config_args['mcmc'])
+        self.set_config_cosmo(config_args['cosmology'])
             
     def set_config_analysis(self, config_args_analysis):
         print("Setting config data....")
@@ -43,6 +44,9 @@ class KarmmaConfig:
 
         return data_dict
     
+    def set_config_cosmo(self, config_args_cosmo):
+        self.emulator_file = config_args_cosmo['emulator_file']
+        
     def set_config_io(self, config_args_io):
         self.datafile = config_args_io['datafile']
         try:
